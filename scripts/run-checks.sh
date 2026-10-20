@@ -64,6 +64,20 @@ skip_step() {
   record "$1" SKIP
 }
 
+# missing_step <name> <reason>: a required tool is missing. Counts as FAIL,
+# because otherwise a run where nothing was tested would report PASS.
+missing_step() {
+  printf 'FAIL  %s (%s)\n' "$1" "$2"
+  record "$1" FAIL
+  FAILED=1
+}
+
+# has_files <find args...>: true when a matching file exists outside
+# dependency and VCS folders.
+has_files() {
+  [ -n "$(find . \( -name node_modules -o -name .venv -o -name venv -o -name .git -o -name vendor \) -prune -o "$@" -print 2>/dev/null | head -n 1)" ]
+}
+
 # ---------- Node ----------
 
 node_pm() {
@@ -109,7 +123,7 @@ node_install() {
   pm="$(node_pm)"
   [ -d node_modules ] && return 0
   node_has_deps || return 0
-  have "$pm" || { skip_step "node: install" "$pm tidak terpasang"; return 0; }
+  have "$pm" || { missing_step "node: install" "$pm tidak terpasang"; return 0; }
   case "$pm" in
     npm)
       if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
@@ -134,7 +148,7 @@ node_checks() {
   local pm s
   pm="$(node_pm)"
   if ! have "$pm"; then
-    skip_step "node" "$pm tidak terpasang"
+    missing_step "node" "$pm tidak terpasang"
     return 0
   fi
   for s in lint typecheck test; do
@@ -183,7 +197,7 @@ python_checks() {
   local py
   py="$(python_bin)"
   if [ -z "$py" ]; then
-    skip_step "python" "python tidak ditemukan"
+    missing_step "python" "python tidak ditemukan"
     return 0
   fi
   if py_has_module "$py" ruff; then
@@ -195,13 +209,15 @@ python_checks() {
     if py_has_module "$py" mypy; then
       run_step "python: mypy" "$py" -m mypy .
     else
-      skip_step "python: mypy" "mypy dikonfigurasi tetapi belum terpasang"
+      missing_step "python: mypy" "mypy dikonfigurasi tetapi belum terpasang"
     fi
   fi
   if py_has_module "$py" pytest; then
     run_step "python: pytest" "$py" -m pytest -q
+  elif [ -d tests ] || [ -d test ] || has_files -name 'test_*.py' -o -name '*_test.py'; then
+    missing_step "python: pytest" "ada file test tetapi pytest belum terpasang"
   else
-    skip_step "python: pytest" "pytest belum terpasang"
+    skip_step "python: pytest" "pytest belum terpasang dan tidak ada file test"
   fi
 }
 
@@ -210,7 +226,7 @@ python_checks() {
 php_install() {
   [ -d vendor ] && return 0
   [ -f composer.lock ] || return 0
-  have composer || { skip_step "php: install" "composer tidak terpasang"; return 0; }
+  have composer || { missing_step "php: install" "composer tidak terpasang"; return 0; }
   run_step "php: install (composer)" composer install --no-interaction --no-progress
 }
 
@@ -219,8 +235,10 @@ php_checks() {
     run_step "php: phpunit" vendor/bin/phpunit
   elif have phpunit; then
     run_step "php: phpunit" phpunit
+  elif [ -f phpunit.xml ] || [ -f phpunit.xml.dist ] || [ -d tests ]; then
+    missing_step "php: phpunit" "ada test tetapi phpunit belum terpasang"
   else
-    skip_step "php: phpunit" "phpunit belum terpasang"
+    skip_step "php: phpunit" "phpunit belum terpasang dan tidak ada test"
   fi
 }
 
@@ -256,7 +274,7 @@ else
       run_step "go: vet" go vet ./...
       run_step "go: test" go test ./...
     else
-      skip_step "go" "go tidak terpasang"
+      missing_step "go" "go tidak terpasang"
     fi
   fi
   if [ -f Cargo.toml ]; then
@@ -269,7 +287,7 @@ else
       fi
       run_step "rust: test" cargo test
     else
-      skip_step "rust" "cargo tidak terpasang"
+      missing_step "rust" "cargo tidak terpasang"
     fi
   fi
   if [ -f Package.swift ]; then
@@ -278,7 +296,7 @@ else
       run_step "swift: build" swift build
       run_step "swift: test" swift test
     else
-      skip_step "swift" "swift tidak terpasang"
+      missing_step "swift" "swift tidak terpasang"
     fi
   fi
   if [ -f composer.json ]; then

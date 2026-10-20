@@ -47,6 +47,8 @@ HOOK_CWD="$(json_field .cwd)"
 [ -n "$COMMAND" ] || exit 0
 
 MODE="$(office_mode)"
+# 1 while HOOK_CWD is known; 0 after a cd to a path the guard cannot resolve.
+CWD_KNOWN=1
 
 block() {
   printf 'BLOCKED by agent-office (%s): %s\n' "$MODE" "$1" >&2
@@ -54,13 +56,41 @@ block() {
 }
 
 # Split a shell command into words and separators, honoring quotes.
-# Output: one item per line, "W<word>" for words and "S" for separators
-# (; & | ( ) and newlines). Quotes are removed from words.
+# Output, one item per line:
+#   W<word>   a word, quotes removed
+#   S         a separator (; & | ( ) ` and newlines)
+#   X<cmd>    a command substitution found inside double quotes
+#   H<body>   a here-doc body (lines joined with ;) for the current command
 tokenize() {
   awk '
+    function flush() { if (inword) { print "W" word; word = ""; inword = 0 } }
+    function oneline(s) { gsub(/\n/, ";", s); return s }
+    # Body of $( ... ) starting at index j; sets END_POS to the closing paren.
+    function subst_body(j,   depth, ch, out) {
+      depth = 1; out = ""
+      while (j <= n) {
+        ch = substr(buf, j, 1)
+        if (ch == "(") depth++
+        else if (ch == ")") { depth--; if (depth == 0) break }
+        out = out ch; j++
+      }
+      END_POS = j
+      return out
+    }
+    # Body of ` ... ` starting at index j; sets END_POS to the closing backtick.
+    function tick_body(j,   ch, out) {
+      out = ""
+      while (j <= n) {
+        ch = substr(buf, j, 1)
+        if (ch == "`") break
+        out = out ch; j++
+      }
+      END_POS = j
+      return out
+    }
     { buf = buf $0 "\n" }
     END {
-      n = length(buf); word = ""; inword = 0; q = ""
+      n = length(buf); word = ""; inword = 0; q = ""; nh = 0
       for (i = 1; i <= n; i++) {
         c = substr(buf, i, 1)
         if (q == "\047") {
@@ -73,7 +103,11 @@ tokenize() {
             if (d == "\"" || d == "\\" || d == "$" || d == "`") { word = word d; i++ }
             else { word = word c }
           } else if (c == "\"") { q = "" }
-          else { word = word (c == "\n" ? " " : c) }
+          else if (c == "$" && substr(buf, i + 1, 1) == "(") {
+            print "X" oneline(subst_body(i + 2)); word = word "$()"; i = END_POS
+          } else if (c == "`") {
+            print "X" oneline(tick_body(i + 1)); i = END_POS
+          } else { word = word (c == "\n" ? " " : c) }
           continue
         }
         if (c == "\\") {
@@ -82,24 +116,63 @@ tokenize() {
           continue
         }
         if (c == "\047" || c == "\"") { q = c; inword = 1; continue }
-        if (c == " " || c == "\t") {
-          if (inword) { print "W" word; word = ""; inword = 0 }
-          continue
-        }
+        if (c == " " || c == "\t") { flush(); continue }
         if (c == "#" && !inword) {
           while (i <= n && substr(buf, i, 1) != "\n") i++
           i--
           continue
         }
+        # Here-string: keep "<<<" as a word, the shell check handles it.
+        if (c == "<" && substr(buf, i + 1, 2) == "<<") {
+          word = word "<<<"; inword = 1; i += 2
+          continue
+        }
+        # Here-doc: remember the delimiter, read the body at the next newline.
+        if (c == "<" && substr(buf, i + 1, 1) == "<") {
+          flush(); i += 2; dash = 0
+          if (substr(buf, i, 1) == "-") { dash = 1; i++ }
+          while (substr(buf, i, 1) == " " || substr(buf, i, 1) == "\t") i++
+          delim = ""
+          while (i <= n) {
+            ch = substr(buf, i, 1)
+            if (ch == " " || ch == "\t" || ch == "\n" || ch == ";" || ch == "&" || ch == "|" || ch == "<" || ch == ">" || ch == ")") break
+            if (ch != "\"" && ch != "\047" && ch != "\\") delim = delim ch
+            i++
+          }
+          i--
+          nh++; hdelim[nh] = delim; hdash[nh] = dash
+          continue
+        }
+        if (c == "\n" && nh > 0) {
+          flush()
+          j = i + 1
+          for (h = 1; h <= nh; h++) {
+            body = ""
+            while (j <= n) {
+              e = index(substr(buf, j), "\n")
+              if (e == 0) { line = substr(buf, j); j = n + 1 }
+              else { line = substr(buf, j, e - 1); j = j + e }
+              cmp = line
+              if (hdash[h]) sub(/^\t+/, "", cmp)
+              if (cmp == hdelim[h]) break
+              body = body line ";"
+            }
+            print "H" body
+          }
+          nh = 0
+          i = j - 1
+          print "S"
+          continue
+        }
         if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")" || c == "\n" || c == "`") {
           if (c == "(" && word == "$") { word = ""; inword = 0 }
-          if (inword) { print "W" word; word = ""; inword = 0 }
+          flush()
           print "S"
           continue
         }
         word = word c; inword = 1
       }
-      if (inword) print "W" word
+      flush()
     }
   '
 }
@@ -141,13 +214,14 @@ short_cluster_has() {
 
 check_git() {
   # $@ = words after "git"
-  local dir="$HOOK_CWD" sub="" t
+  local dir="$HOOK_CWD" dir_known="$CWD_KNOWN" sub="" t pos
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -C)
         shift
         case "${1:-}" in
-          /*) dir="$1" ;;
+          *'$'*) dir_known=0 ;;
+          /*) dir="$1"; dir_known=1 ;;
           *) dir="$HOOK_CWD/${1:-}" ;;
         esac
         ;;
@@ -160,11 +234,42 @@ check_git() {
   [ -n "$sub" ] || return 0
 
   case "$sub" in
-    merge|rebase|cherry-pick)
-      for t in "$@"; do
-        case "$t" in --abort|--quit) return 0 ;; esac
-      done
+    merge|rebase|cherry-pick|pull)
+      if [ "$sub" != "pull" ]; then
+        for t in "$@"; do
+          case "$t" in --abort|--quit) return 0 ;; esac
+        done
+      fi
       block "git $sub tidak diizinkan untuk agent. Penggabungan dilakukan oleh user."
+      ;;
+    update-ref)
+      for t in "$@"; do
+        case "$t" in
+          -d|--stdin) block "git update-ref $t tidak diizinkan." ;;
+          -*) ;;
+          *) office_is_protected "$t" && block "git update-ref ke branch terlindungi '$t' tidak diizinkan." ;;
+        esac
+      done
+      ;;
+    symbolic-ref)
+      pos=""
+      for t in "$@"; do
+        case "$t" in -*) ;; *) pos="$t" ;; esac
+      done
+      if [ -n "$pos" ] && office_is_protected "$pos"; then
+        block "git symbolic-ref ke branch terlindungi '$pos' tidak diizinkan."
+      fi
+      ;;
+    fetch)
+      for t in "$@"; do
+        case "$t" in
+          *:*)
+            t="${t#+}"
+            office_is_protected "${t#*:}" \
+              && block "git fetch yang menimpa branch terlindungi '${t#*:}' tidak diizinkan."
+            ;;
+        esac
+      done
       ;;
     reset)
       for t in "$@"; do
@@ -179,26 +284,49 @@ check_git() {
       done
       ;;
     branch)
+      local moves=0
+      pos=""
       for t in "$@"; do
         if [ "$t" = "--delete" ] || short_cluster_has "$t" dD; then
           block "menghapus branch (git branch -d/-D) tidak diizinkan untuk agent."
         fi
-      done
-      ;;
-    worktree)
-      for t in "$@"; do
         case "$t" in
-          -*) ;;
-          remove|prune) block "git worktree $t tidak diizinkan. Worktree dikelola oleh finish-task.sh (user)." ;;
-          *) break ;;
+          --force|--move|--copy) moves=1 ;;
+          --*) ;;
+          -*) short_cluster_has "$t" fmMcC && moves=1 ;;
+          *) office_is_protected "$t" && pos="$t" ;;
         esac
       done
+      if [ "$moves" = "1" ] && [ -n "$pos" ]; then
+        block "memindahkan, menimpa, atau menyalin ke branch terlindungi '$pos' tidak diizinkan."
+      fi
+      ;;
+    worktree)
+      local action="" newb=0
+      for t in "$@"; do
+        if [ -z "$action" ]; then
+          case "$t" in
+            -*) ;;
+            *) action="$t" ;;
+          esac
+          continue
+        fi
+        case "$action:$t" in
+          add:-b|add:-B) newb=1 ;;
+          add:-*) ;;
+          add:*) [ "$newb" = "0" ] && office_is_protected "$(strip_remote "$t" "$dir")" \
+              && block "git worktree add untuk branch terlindungi '$t' tidak diizinkan." ;;
+        esac
+      done
+      case "$action" in
+        remove|prune) block "git worktree $action tidak diizinkan. Worktree dikelola oleh finish-task.sh (user)." ;;
+      esac
       ;;
     checkout|switch)
       check_switch "$dir" "$sub" "$@"
       ;;
     push)
-      check_push "$dir" "$@"
+      check_push "$dir" "$dir_known" "$@"
       ;;
   esac
   return 0
@@ -236,9 +364,9 @@ check_switch() {
 }
 
 check_push() {
-  local dir="$1" t remote="" refspec dst src cur expect_arg=0
+  local dir="$1" dir_known="$2" t remote="" refspec dst src cur expect_arg=0
   local refspecs=""
-  shift
+  shift 2
   if [ "$MODE" = "local" ]; then
     block "git push tidak diizinkan di mode local. User yang menerima task lewat finish-task.sh."
   fi
@@ -266,6 +394,9 @@ check_push() {
     esac
   done
 
+  if [ "$dir_known" != "1" ]; then
+    block "git push setelah cd ke path dinamis tidak bisa diperiksa. Pakai: git -C <path absolut> push ..."
+  fi
   if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
     cur="$(office_current_branch "$dir")"
     [ -n "$cur" ] || block "git push dari detached HEAD tidak diizinkan."
@@ -353,15 +484,73 @@ check_gh() {
   return 0
 }
 
-# check_segment <words...>: one simple command.
+# wrapper_argflags <wrapper>: options of a wrapper that take a separate value.
+wrapper_argflags() {
+  case "$1" in
+    env) echo "-u -C --unset --chdir" ;;
+    nice) echo "-n --adjustment" ;;
+    exec) echo "-a" ;;
+    time) echo "-o -f --output --format" ;;
+    timeout) echo "-s -k --signal --kill-after" ;;
+    stdbuf) echo "-i -o -e --input --output --error" ;;
+    ionice) echo "-c -n -p -t --class --classdata" ;;
+    xargs) echo "-I -n -P -L -d -E -s -a --max-args --max-procs --delimiter --arg-file --replace" ;;
+  esac
+}
+
+# track_cd <args of cd>: follow the working directory for later commands.
+track_cd() {
+  local target
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      -L|-P|-e|-@) shift ;;
+      *) break ;;
+    esac
+  done
+  target="${1:-$HOME}"
+  case "$target" in
+    -|*'$'*|*'`'*) CWD_KNOWN=0 ;;
+    "~") HOOK_CWD="$HOME" ;;
+    "~/"*) HOOK_CWD="$HOME/${target#"~/"}" ;;
+    /*) HOOK_CWD="$target" ;;
+    *) HOOK_CWD="$HOOK_CWD/$target" ;;
+  esac
+}
+
+# check_segment <words...>: one simple command. HEREDOC_BODY holds the body
+# of a here-doc attached to it, if any.
 check_segment() {
-  local cmd base t
-  # Skip environment assignments and transparent wrappers.
+  local cmd base t w argflags
+  # Skip environment assignments, keywords, and transparent wrappers.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       [A-Za-z_]*=*) shift ;;
-      env|command|builtin|exec|nohup|time|nice|then|do|else|"!"|"{") shift ;;
-      timeout) shift; [ "$#" -gt 0 ] && shift ;;
+      if|then|elif|else|do|while|until|"!"|"{"|builtin) shift ;;
+      env|command|exec|nohup|time|nice|timeout|stdbuf|ionice|xargs)
+        w="$1"
+        shift
+        argflags=" $(wrapper_argflags "$w") "
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift; break ;;
+            -S|--split-string)
+              [ "$w" = "env" ] && check_string "${2:-}"
+              shift; [ "$#" -gt 0 ] && shift ;;
+            --split-string=*) [ "$w" = "env" ] && check_string "${1#*=}"; shift ;;
+            -*)
+              case "$argflags" in
+                *" $1 "*) shift; [ "$#" -gt 0 ] && shift ;;
+                *) shift ;;
+              esac
+              ;;
+            [A-Za-z_]*=*) if [ "$w" = "env" ]; then shift; else break; fi ;;
+            *) break ;;
+          esac
+        done
+        # timeout takes a duration before the command.
+        if [ "$w" = "timeout" ] && [ "$#" -gt 0 ]; then shift; fi
+        ;;
       *) break ;;
     esac
   done
@@ -371,6 +560,7 @@ check_segment() {
   base="${cmd##*/}"
 
   case "$base" in
+    cd|pushd) track_cd "$@" ;;
     sudo|doas) block "sudo tidak diizinkan." ;;
     finish-task.sh|agent-office)
       block "finish-task.sh hanya boleh dijalankan oleh user, bukan agent." ;;
@@ -392,19 +582,24 @@ check_segment() {
       ;;
   esac
 
-  if is_shell "$base"; then
-    local expect_c=0
+  if is_shell "$base" || [ "$base" = "source" ] || [ "$base" = "." ]; then
+    local expect_c=0 expect_here=0
     for t in "$@"; do
-      if [ "$expect_c" = "1" ]; then
+      if [ "$expect_c" = "1" ] || [ "$expect_here" = "1" ]; then
         check_string "$t"
         expect_c=0
+        expect_here=0
         continue
       fi
       case "$t" in
         -c|-*c) expect_c=1 ;;
+        "<<<") expect_here=1 ;;
+        "<<<"*) check_string "${t#<<<}" ;;
         *finish-task.sh) block "finish-task.sh hanya boleh dijalankan oleh user, bukan agent." ;;
       esac
     done
+    # A here-doc fed to a shell is executed: check its body too.
+    [ -n "$HEREDOC_BODY" ] && check_string "$HEREDOC_BODY"
   fi
   return 0
 }
@@ -417,6 +612,7 @@ check_string() {
   (
     words=()
     count=0
+    HEREDOC_BODY=""
     while IFS= read -r item; do
       case "$item" in
         S)
@@ -425,11 +621,14 @@ check_string() {
           fi
           words=()
           count=0
+          HEREDOC_BODY=""
           ;;
         W*)
           words[$count]="${item#W}"
           count=$((count + 1))
           ;;
+        X*) check_string "${item#X}" ;;
+        H*) HEREDOC_BODY="$HEREDOC_BODY${item#H}" ;;
       esac
     done <<EOF_TOKENS
 $(printf '%s\n' "$1" | tokenize)

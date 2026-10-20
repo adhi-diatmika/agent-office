@@ -211,11 +211,17 @@ jalankan `install-cli.sh` lagi.
 - Hook `PreToolUse` (`hooks/guard-bash.sh`) adalah **pagar pengaman, bukan
   sandbox**. Ia memblokir (exit 2) perintah Bash seperti `git push` di mode
   local, force push dan push ke branch terlindungi di mode cloud, `git merge`,
-  `rebase`, `cherry-pick`, `reset --hard`, `clean -f`, hapus branch atau
-  worktree, checkout ke branch terlindungi, `gh pr merge/close`, `sudo`,
-  `rm -r` ke `/`, `~`, `$HOME`, atau `..`, `curl | sh`, dan `npm publish`.
+  `pull`, `rebase`, `cherry-pick`, `reset --hard`, `clean -f`, hapus branch
+  atau worktree, checkout ke branch terlindungi, memindahkan atau menimpa
+  branch terlindungi (`branch -f/-M`, `update-ref`, `fetch x:main`),
+  `gh pr merge/close`, `sudo`, `rm -r` ke `/`, `~`, `$HOME`, atau `..`,
+  `curl | sh`, dan `npm publish`. Guard juga memeriksa perintah di dalam
+  `$(...)`, `bash -c`, wrapper seperti `env`/`timeout`/`xargs`, dan here-doc
+  yang dikirim ke shell, serta mengikuti `cd` di perintah yang sama.
   Perintah yang disamarkan dengan cukup kreatif tetap bisa lolos. Tetap review
   hasilnya sebelum menerima.
+- `git pull` diblokir untuk agent karena sama dengan merge atau rebase. Pakai
+  `git fetch` jika perlu melihat perubahan terbaru.
 - Guard berlaku di **semua** sesi tempat plugin aktif, termasuk saat kamu
   bekerja biasa dengan Claude. Untuk mematikannya sementara, set
   `AGENT_OFFICE_GUARD=off` di environment Claude Code (misalnya lewat `env`

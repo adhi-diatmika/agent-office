@@ -78,11 +78,13 @@ if [ "$MODE" = "local" ]; then
   git -C "$REPO_ROOT" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_COMMIT" >&2 \
     || die "git worktree add gagal untuk $WORKTREE."
 else
-  WORKTREE="$REPO_ROOT"
+  # Work in the checkout the script was started from. It is the repo root in
+  # a normal cloud session, but may be a linked worktree.
+  WORKTREE="$(git rev-parse --show-toplevel)" || die "tidak bisa menentukan folder kerja."
   BRANCH="$CURRENT_BRANCH"
   if office_is_protected "$CURRENT_BRANCH"; then
     BRANCH="office/$SLUG"
-    git -C "$REPO_ROOT" checkout -q -b "$BRANCH" >&2 \
+    git -C "$WORKTREE" checkout -q -b "$BRANCH" >&2 \
       || die "gagal membuat branch $BRANCH."
   fi
 fi

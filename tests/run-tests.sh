@@ -55,6 +55,15 @@ check() {
   fi
 }
 
+# hook_json <command> <cwd>: hook input JSON, with jq or python3.
+hook_json() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg c "$1" --arg d "$2" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}'
+  else
+    python3 -c 'import json, sys; print(json.dumps({"tool_name": "Bash", "tool_input": {"command": sys.argv[1]}, "cwd": sys.argv[2]}))' "$1" "$2"
+  fi
+}
+
 kv() { grep -E "^$1=" | head -n 1 | sed -e "s/^$1=//"; }
 
 new_repo() {
@@ -205,6 +214,20 @@ custom() {
 }
 check "checks: .claude/checks.sh replaces auto-detect" custom
 
+pytest_missing() {
+  local d="$WORK/pymissing"
+  mkdir -p "$d/.venv/bin" "$d/tests"
+  printf '[project]\nname = "p"\n' >"$d/pyproject.toml"
+  printf 'def test_x():\n    assert True\n' >"$d/tests/test_x.py"
+  # A python that has no modules at all.
+  printf '#!/bin/sh\nexit 1\n' >"$d/.venv/bin/python"
+  chmod +x "$d/.venv/bin/python"
+  local out
+  out="$(PATH="/usr/bin:/bin" bash "$S/run-checks.sh" "$d" 2>&1)" && return 1
+  printf '%s' "$out" | grep -q '^FAIL  python: pytest' && printf '%s' "$out" | grep -q '^Result: FAIL'
+}
+check "checks: tests present but pytest missing is FAIL" pytest_missing
+
 nothing() {
   local d="$WORK/nothing"
   mkdir -p "$d"
@@ -269,7 +292,7 @@ printf 'cloud change\n' >"$C/change.txt"
 git -C "$C" add -A && git -C "$C" commit -q -m "cloud change"
 guard_rc() {
   # guard_rc <mode> <cwd> <command>: prints the guard exit code
-  jq -n --arg c "$3" --arg d "$2" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
+  hook_json "$3" "$2" \
     | OFFICE_MODE="$1" bash "$H/guard-bash.sh" >/dev/null 2>>"$LOG"
   printf '%s' "$?"
 }
@@ -285,6 +308,17 @@ printf '%s\n' "$OUT4" >>"$LOG"
 T4_BR="$(printf '%s\n' "$OUT4" | kv BRANCH)"
 check "cloud: on main creates office/<slug>" sh -c "printf '%s' '$T4_BR' | grep -Eq '^office/[0-9]{4}-[0-9]{4}-from-main$'"
 check "cloud: switched to office branch" test "$(git -C "$C2" symbolic-ref --short HEAD)" = "$T4_BR"
+
+linked_cloud() {
+  local wt="$WORK/cloud-linked-wt" out
+  git -C "$C" worktree add -q -b feat/linked "$wt" >>"$LOG" 2>&1 || return 1
+  out="$(cd "$wt" && CLAUDE_CODE_REMOTE=true bash "$S/new-task.sh" "Linked" 2>>"$LOG")" || return 1
+  printf '%s\n' "$out" >>"$LOG"
+  test "$(printf '%s\n' "$out" | kv WORKTREE)" = "$(cd "$wt" && pwd)" \
+    && test "$(printf '%s\n' "$out" | kv BRANCH)" = feat/linked \
+    && test "$(git -C "$C" symbolic-ref --short HEAD)" = claude/test
+}
+check "cloud: linked worktree uses its own checkout" linked_cloud
 
 # ===================== Session start hook =====================
 
@@ -363,6 +397,45 @@ for m in local cloud; do
   expect_guard 2 "$m" "$G" '(git merge main)'
   expect_guard 2 "$m" "$G" 'bash -c "git merge main"'
 
+  expect_guard 2 "$m" "$G" 'if git merge main; then :; fi'
+  expect_guard 2 "$m" "$G" 'while git merge main; do :; done'
+  expect_guard 2 "$m" "$G" 'until git rebase main; do :; done'
+  expect_guard 2 "$m" "$G" 'if true; then :; elif git merge main; then :; fi'
+  expect_guard 2 "$m" "$G" 'echo "$(git merge main)"'
+  expect_guard 2 "$m" "$G" 'x="`git reset --hard HEAD~3`"'
+  expect_guard 2 "$m" "$G" 'echo "a $(echo "$(git rebase main)") b"'
+  expect_guard 2 "$m" "$G" 'git pull origin main'
+  expect_guard 2 "$m" "$G" 'git pull --rebase origin main'
+  expect_guard 2 "$m" "$G" 'git branch -f main HEAD'
+  expect_guard 2 "$m" "$G" 'git branch -M main'
+  expect_guard 2 "$m" "$G" 'git branch --force master HEAD'
+  expect_guard 2 "$m" "$G" 'git update-ref refs/heads/main HEAD'
+  expect_guard 2 "$m" "$G" 'git update-ref -d refs/heads/office/x'
+  expect_guard 2 "$m" "$G" 'git symbolic-ref HEAD refs/heads/main'
+  expect_guard 2 "$m" "$G" 'git fetch . HEAD:main'
+  expect_guard 2 "$m" "$G" 'git fetch origin +feature/x:refs/heads/main'
+  expect_guard 2 "$m" "$G" 'git worktree add ../wt main'
+  expect_guard 2 "$m" "$G" 'env -i git merge main'
+  expect_guard 2 "$m" "$G" 'env -u FOO A=1 git merge main'
+  expect_guard 2 "$m" "$G" 'env -S "git merge main"'
+  expect_guard 2 "$m" "$G" 'nice -n 5 git merge main'
+  expect_guard 2 "$m" "$G" 'time -p git merge main'
+  expect_guard 2 "$m" "$G" 'timeout -s KILL 5 git merge main'
+  expect_guard 2 "$m" "$G" 'timeout 5 git merge main'
+  expect_guard 2 "$m" "$G" 'command git merge main'
+  expect_guard 2 "$m" "$G" 'xargs -n 1 git branch -D'
+  expect_guard 2 "$m" "$G" "$(printf 'bash <<EOF\ngit merge main\nEOF')"
+  expect_guard 2 "$m" "$G" "$(printf "cat > a.txt <<'EOF'\ndon't stop\nEOF\ngit merge main")"
+  expect_guard 2 "$m" "$G" 'bash <<< "git merge main"'
+
+  expect_guard 0 "$m" "$G" "$(printf "cat > NOTES.md <<'EOF'\ngit merge main\nsudo apt install x\nrm -rf /\nEOF")"
+  expect_guard 0 "$m" "$G" "$(printf 'cat <<-EOF > a.sh\n\tgit rebase main\n\tEOF\necho done')"
+  expect_guard 0 "$m" "$G" 'echo "$(git status --porcelain)"'
+  expect_guard 0 "$m" "$G" 'git branch -m feature/old feature/new'
+  expect_guard 0 "$m" "$G" 'git branch --list main'
+  expect_guard 0 "$m" "$G" 'git fetch origin main'
+  expect_guard 0 "$m" "$G" 'git worktree add -b feature/y ../wt main'
+  expect_guard 0 "$m" "$G" 'git worktree list'
   expect_guard 0 "$m" "$G" 'git commit -m "merge the parser fix"'
   expect_guard 0 "$m" "$G" "git commit -m 'Merge branch handling; rebase notes'"
   expect_guard 0 "$m" "$G" 'rm -rf node_modules'
@@ -414,14 +487,20 @@ expect_guard 2 cloud "$GM" 'git push -u origin HEAD'
 expect_guard 2 cloud "$GM" 'git push'
 expect_guard 2 cloud "$GD" 'git push origin HEAD:feature/x'
 expect_guard 2 cloud "$WORK" "git -C '$GM' push"
+expect_guard 2 cloud "$G" "cd '$GM' && git push"
+expect_guard 2 cloud "$G" "cd '$GM' && git push origin HEAD"
+expect_guard 2 cloud "$WORK" "cd guard-main; git push -u origin HEAD"
+expect_guard 2 cloud "$G" 'cd "$REPO" && git push origin feature/x'
+expect_guard 0 cloud "$GM" "cd '$G' && git push -u origin feature/x"
+expect_guard 0 cloud "$WORK" "cd guard && git push -u origin feature/x"
 
 guard_off() {
-  jq -n --arg c 'git merge main' --arg d "$G" '{tool_input:{command:$c},cwd:$d}' \
+  hook_json 'git merge main' "$G" \
     | AGENT_OFFICE_GUARD=off bash "$H/guard-bash.sh"
 }
 check "guard: AGENT_OFFICE_GUARD=off disables" guard_off
 guard_msg() {
-  jq -n --arg c 'git merge main' --arg d "$G" '{tool_input:{command:$c},cwd:$d}' \
+  hook_json 'git merge main' "$G" \
     | OFFICE_MODE=local bash "$H/guard-bash.sh" 2>&1 >/dev/null | grep -q '^BLOCKED by agent-office (local): '
 }
 check "guard: message format on stderr" guard_msg
