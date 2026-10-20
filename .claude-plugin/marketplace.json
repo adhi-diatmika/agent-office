@@ -1,0 +1,15 @@
+{
+  "name": "agent-office",
+  "description": "Marketplace for the agent-office plugin.",
+  "owner": {
+    "name": "adhi-diatmika",
+    "url": "https://github.com/adhi-diatmika"
+  },
+  "plugins": [
+    {
+      "name": "agent-office",
+      "source": "./",
+      "description": "Planner, builder, and independent reviewer subagents for any Git project."
+    }
+  ]
+}

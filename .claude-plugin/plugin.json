@@ -1,0 +1,13 @@
+{
+  "name": "agent-office",
+  "version": "1.0.0",
+  "description": "A small office of AI subagents for any Git project: a planner, a builder, and an independent reviewer.",
+  "author": {
+    "name": "adhi-diatmika",
+    "url": "https://github.com/adhi-diatmika"
+  },
+  "homepage": "https://github.com/adhi-diatmika/agent-office",
+  "repository": "https://github.com/adhi-diatmika/agent-office",
+  "license": "MIT",
+  "keywords": ["subagents", "planner", "builder", "reviewer", "worktree", "workflow"]
+}

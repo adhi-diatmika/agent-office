@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "agent-office": {
+      "source": {
+        "source": "github",
+        "repo": "adhi-diatmika/agent-office"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "agent-office@agent-office": true
+  }
+}
