@@ -116,7 +116,7 @@ strip_remote() {
   local ref="$1" dir="$2" r
   case "$ref" in
     */*)
-      for r in $(git -C "$dir" remote 2>/dev/null); do
+      for r in origin upstream $(git -C "$dir" remote 2>/dev/null); do
         case "$ref" in
           "$r"/*) printf '%s' "${ref#"$r"/}"; return ;;
         esac
